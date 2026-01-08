@@ -1,91 +1,162 @@
 package view;
 
 import javax.swing.*;
-
-
-import Server.Server;
-import java.awt.event.ActionEvent;
-import java.awt.event.ActionListener;
+import javax.swing.border.*;
 import java.awt.*;
+import java.awt.event.*;
+import Server.Server;
 
 public class ServerView extends JFrame {
-    public JTextArea chatArea;
-    public Server server;
-    public JPanel participantPanel;
- 
-    public void setServer(Server server) {
-        this.server = server;
-    }
+    private JTextArea logArea;
+    private DefaultListModel<String> onlineListModel;
+    private JList<String> onlineList;
+    private JTextField msgField;
+    private JButton btnSendAll;
+    private Server server;
 
-    public void addMessage(String message) {
-        chatArea.append(message + "\n");
-    }
+    public ServerView() {
+        setTitle("Server Monitor - SBTC Messenger");
+        setSize(900, 600);
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setLocationRelativeTo(null);
 
-    public JTextArea getChatArea() {
-        return chatArea;
-    }
+        // --- Thiết lập giao diện màu sắc ---
+        Color backgroundColor = new Color(245, 245, 245);
+        Font mainFont = new Font("Segoe UI", Font.PLAIN, 14);
+        Font titleFont = new Font("Segoe UI", Font.BOLD, 16);
 
-    // Thêm một panel mới cho người tham gia cuộc trò chuyện
-    public void addParticipant(String username, JPanel participantPanel) {
-        JPanel newParticipantPanel = new JPanel();
-        newParticipantPanel.setLayout(new FlowLayout(FlowLayout.LEFT));
-        newParticipantPanel.setBackground(new Color(255, 255, 255));
+        JPanel mainPanel = new JPanel(new BorderLayout(10, 10));
+        mainPanel.setBorder(new EmptyBorder(10, 10, 10, 10));
+        mainPanel.setBackground(backgroundColor);
+        setContentPane(mainPanel);
 
-        JLabel participantName = new JLabel(username);
-        JButton removeButton = new JButton("Xóa");
+        // --- PHẦN GIỮA (Split Pane) ---
+        // 1. Bên trái: Danh sách Online
+        onlineListModel = new DefaultListModel<>();
+        onlineList = new JList<>(onlineListModel);
+        onlineList.setFont(mainFont);
+        
+        // Tạo Menu Chuột Phải (Popup Menu)
+        JPopupMenu popupMenu = new JPopupMenu();
+        JMenuItem kickItem = new JMenuItem("Kick (Ngắt kết nối)");
+        kickItem.setForeground(Color.RED);
+        kickItem.setIcon(UIManager.getIcon("OptionPane.errorIcon")); // Icon cảnh báo nhỏ
+        popupMenu.add(kickItem);
 
-        // Xử lý khi nhấn nút "Xóa"
-        removeButton.addActionListener(new ActionListener() {
+        // Lắng nghe sự kiện chuột trên danh sách
+        onlineList.addMouseListener(new MouseAdapter() {
             @Override
-            public void actionPerformed(ActionEvent e) {
-                // Xóa người tham gia khỏi cuộc trò chuyện
-                removeParticipant(newParticipantPanel, username);
+            public void mousePressed(MouseEvent e) {
+                if (SwingUtilities.isRightMouseButton(e)) {
+                    // Xác định xem chuột nhấn vào dòng nào
+                    int index = onlineList.locationToIndex(e.getPoint());
+                    if (index != -1) {
+                        onlineList.setSelectedIndex(index); // Tự động chọn dòng đó
+                        popupMenu.show(onlineList, e.getX(), e.getY()); // Hiện menu
+                    }
+                }
             }
         });
 
-        newParticipantPanel.add(participantName);
-        newParticipantPanel.add(removeButton);
-        participantPanel.add(newParticipantPanel);
-        participantPanel.revalidate();
-        participantPanel.repaint();
+        // Xử lý khi nhấn nút "Kick"
+        kickItem.addActionListener(e -> {
+            String selectedUser = onlineList.getSelectedValue();
+            if (selectedUser != null) {
+                int confirm = JOptionPane.showConfirmDialog(this, 
+                    "Bạn có chắc muốn đuổi " + selectedUser + " ra khỏi server?", 
+                    "Xác nhận Kick", JOptionPane.YES_NO_OPTION);
+                
+                if (confirm == JOptionPane.YES_OPTION) {
+                    server.removeClient(selectedUser); // Gọi hàm xóa trong Server
+                    addMessage("[KICKED] Admin đã đuổi người dùng: " + selectedUser);
+                }
+            }
+        });
+
+        // Custom giao diện dòng trong list
+        onlineList.setCellRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
+                JLabel label = (JLabel) super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                label.setBorder(new EmptyBorder(8, 10, 8, 10));
+                if (!isSelected) {
+                    label.setBackground(index % 2 == 0 ? Color.WHITE : new Color(248, 248, 248));
+                }
+                return label;
+            }
+        });
+
+        JPanel leftPanel = new JPanel(new BorderLayout());
+        leftPanel.setBorder(new TitledBorder(new LineBorder(Color.LIGHT_GRAY), "Clients Online", TitledBorder.LEFT, TitledBorder.TOP, titleFont));
+        leftPanel.add(new JScrollPane(onlineList), BorderLayout.CENTER);
+
+        // 2. Bên phải: Log hệ thống
+        logArea = new JTextArea();
+        logArea.setEditable(false);
+        logArea.setFont(new Font("Consolas", Font.PLAIN, 13));
+        logArea.setBackground(Color.WHITE);
+
+        JPanel rightPanel = new JPanel(new BorderLayout());
+        rightPanel.setBorder(new TitledBorder(new LineBorder(Color.LIGHT_GRAY), "Server Log", TitledBorder.LEFT, TitledBorder.TOP, titleFont));
+        rightPanel.add(new JScrollPane(logArea), BorderLayout.CENTER);
+
+        JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, leftPanel, rightPanel);
+        splitPane.setDividerLocation(250);
+        mainPanel.add(splitPane, BorderLayout.CENTER);
+
+        // --- PHẦN DƯỚI (Gửi thông báo) ---
+        JPanel bottomPanel = new JPanel(new BorderLayout(10, 0));
+        bottomPanel.setOpaque(false);
+        bottomPanel.setBorder(new EmptyBorder(5, 0, 0, 0));
+
+        msgField = new JTextField();
+        msgField.setFont(mainFont);
+        btnSendAll = new JButton("Gửi Tất Cả");
+        btnSendAll.setFocusPainted(false);
+
+        bottomPanel.add(new JLabel("Thông báo hệ thống: "), BorderLayout.WEST);
+        bottomPanel.add(msgField, BorderLayout.CENTER);
+        bottomPanel.add(btnSendAll, BorderLayout.EAST);
+
+        mainPanel.add(bottomPanel, BorderLayout.SOUTH);
+
+        // Sự kiện gửi thông báo
+        ActionListener sendAction = e -> {
+            String msg = msgField.getText().trim();
+            if (!msg.isEmpty() && server != null) {
+                server.broadcastChat("THÔNG BÁO TỪ ADMIN: " + msg, "BROADCAST");
+                addMessage("[GLOBAL MSG] " + msg);
+                msgField.setText("");
+            }
+        };
+        btnSendAll.addActionListener(sendAction);
+        msgField.addActionListener(sendAction);
     }
 
-    // Xóa người tham gia khỏi cuộc trò chuyện
-    public void removeParticipant(JPanel participantPanel, String username) {
-        // Xóa người dùng khỏi server
-        server.removeClient(username);
-        // Loại bỏ panel khỏi giao diện
-        participantPanel.removeAll();
-        participantPanel.revalidate();
-        participantPanel.repaint();
+    // --- CÁC PHƯƠNG THỨC ĐỒNG BỘ VỚI SERVER.JAVA ---
+
+    public void addMessage(String message) {
+        SwingUtilities.invokeLater(() -> {
+            logArea.append(message + "\n");
+            logArea.setCaretPosition(logArea.getDocument().getLength());
+        });
     }
 
-    public ServerView() {
-        getContentPane().setBackground(new Color(0, 64, 128));
-        getContentPane().setForeground(new Color(0, 64, 128));
-        setTitle("Chat Server");
-        setSize(600, 491);
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setLocationRelativeTo(null);
-        getContentPane().setLayout(null);
+    public void addParticipant(String username, JPanel unused) {
+        SwingUtilities.invokeLater(() -> {
+            if (!onlineListModel.contains(username)) {
+                onlineListModel.addElement(username);
+            }
+        });
+    }
 
-        chatArea = new JTextArea();
-        chatArea.setFont(new Font("Tahoma", Font.BOLD, 12));
-        chatArea.setMargin(new Insets(10, 10, 10, 10));
-        chatArea.setBounds(30, 57, 531, 221);
-        getContentPane().add(chatArea);
+    public void removeParticipant(String username) {
+        SwingUtilities.invokeLater(() -> {
+            onlineListModel.removeElement(username);
+        });
+    }
 
-        JLabel lblNewLabel = new JLabel("SBTC Server Messenger");
-        lblNewLabel.setForeground(new Color(255, 255, 255));
-        lblNewLabel.setFont(new Font("Tahoma", Font.BOLD, 20));
-        lblNewLabel.setBounds(185, 10, 257, 37);
-        getContentPane().add(lblNewLabel);
-
-        // Panel chứa danh sách người tham gia
-        participantPanel = new JPanel();
-        participantPanel.setLayout(new BoxLayout(participantPanel, BoxLayout.Y_AXIS));
-        JScrollPane participantScrollPane = new JScrollPane(participantPanel);
-        participantScrollPane.setBounds(124, 288, 354, 142);
-        getContentPane().add(participantScrollPane);
+    public void setServer(Server server) {
+        this.server = server;
     }
 }

@@ -5,10 +5,7 @@ import java.net.*;
 import java.nio.file.Files;
 import java.util.*;
 import java.util.concurrent.*;
-
 import javax.swing.JPanel;
-
-import Server.Server.ClientHandler;
 import common.Protocol;
 import config.ConnectDatabase;
 import view.ServerView;
@@ -18,10 +15,7 @@ public class Server implements Runnable {
 	private final int PORT = 2209;
 	private ServerView view;
 	private ServerSocket server;
-//    private ExecutorService pool;
-	// Danh sách client, kiểu ChatServer
 	private static List<ClientHandler> clients = Collections.synchronizedList(new ArrayList<>());
-	// NEW: Bảng tra cứu theo userId
 	private static Map<Integer, ClientHandler> clientsById = new ConcurrentHashMap<>();
 
 	public Server(ServerView view) {
@@ -32,28 +26,27 @@ public class Server implements Runnable {
 	public void run() {
 		try {
 			server = new ServerSocket(PORT);
-//            pool = Executors.newCachedThreadPool();
-			view.addMessage("Server started on port " + PORT);
+			view.addMessage("[INFO] Server started on port " + PORT);
 
 			while (true) {
 				Socket socket = server.accept();
 				new Thread(() -> handleClient(socket)).start();
 			}
-
 		} catch (IOException e) {
+			view.addMessage("[ERROR] Server Error: " + e.getMessage());
 			e.printStackTrace();
 		}
 	}
 
 	private void handleClient(Socket socket) {
+		String clientUsername = "Unknown";
 		try {
 			DataInputStream dis = new DataInputStream(socket.getInputStream());
 			DataOutputStream dos = new DataOutputStream(socket.getOutputStream());
 
-			// --- Đọc lệnh đầu tiên ---
 			String firstToken = dis.readUTF();
 
-			// Nếu là lệnh REGISTER -> xử lý đăng ký
+			// --- XỬ LÝ ĐĂNG KÝ ---
 			if ("REGISTER".equals(firstToken)) {
 				String username = dis.readUTF();
 				String password = dis.readUTF();
@@ -62,20 +55,14 @@ public class Server implements Runnable {
 				String createAt = dis.readUTF();
 
 				boolean ok = ConnectDatabase.registerUser(username, password, phone, gender, createAt);
-
-				if (ok) {
-					dos.writeUTF("REGISTER_SUCCESS");
-					view.addMessage("Người đăng ký mới: " + username);
-				} else {
-					dos.writeUTF("REGISTER_FAILED");
-					view.addMessage("Đăng ký thất bại: " + username);
-				}
+				dos.writeUTF(ok ? "REGISTER_SUCCESS" : "REGISTER_FAILED");
 				dos.flush();
-				socket.close(); // Đóng sau khi đăng ký xong
+				view.addMessage("[REGISTER] " + username + (ok ? " thành công." : " thất bại."));
+				socket.close();
 				return;
 			}
 
-			// --- Còn lại là luồng LOGIN như cũ ---
+			// --- XỬ LÝ ĐĂNG NHẬP ---
 			String username = firstToken;
 			String password = dis.readUTF();
 
@@ -87,487 +74,337 @@ public class Server implements Runnable {
 			}
 
 			int userId = ConnectDatabase.idUser(username, password);
+			clientUsername = username; 
+			
 			dos.writeUTF("LOGIN_SUCCESS");
 			dos.flush();
-			view.addMessage(username + " đã đăng nhập thành công." + socket.getInetAddress().getHostAddress());
 
-			view.addParticipant(username, view.participantPanel);
+			view.addMessage("[LOGIN] " + username + " đã kết nối từ " + socket.getInetAddress().getHostAddress());
+			view.addParticipant(username, null); 
+
 			ClientHandler client = new ClientHandler(userId, username, socket, dis, dos);
 			clients.add(client);
 			clientsById.put(userId, client);
 
 			sendFriendList(client);
+			sendUserGroups(client);
 
-			// === Gửi danh sách nhóm mà user thuộc về ===
-			List<String[]> groups = ConnectDatabase.getGroupsOfUser(userId);
-			for (String[] g : groups) {
-				int gid = Integer.parseInt(g[0]);
-				String gname = g[1];
-
-				try {
-					dos.writeUTF("GROUP_CREATED");
-					dos.writeInt(gid);
-					dos.writeUTF(gname);
-					dos.flush();
-				} catch (IOException e) {
-					e.printStackTrace();
-				}
-			}
-
-// nguyen bo sung them ca thieu
-
+			// --- LUỒNG NHẬN LỆNH CHÍNH ---
 			while (true) {
 				String type = dis.readUTF();
 
 				if (type.equals("CREATE_GROUP")) {
-					String groupName = dis.readUTF();
-					int count = dis.readInt();
-					java.util.List<Integer> members = new java.util.ArrayList<>();
-					for (int i = 0; i < count; i++)
-						members.add(dis.readInt());
-
-					int gid = ConnectDatabase.createGroup(groupName, client.userId, members);
-
-					// Gửi thông báo GROUP_CREATED cho tất cả thành viên nhóm
-					String finalGroupName = groupName;
-					java.util.List<Integer> allMembers = new java.util.ArrayList<>(members);
-					allMembers.add(client.userId); // thêm cả người tạo nhóm
-
-					for (int uid : allMembers) {
-						ClientHandler ch = clientsById.get(uid);
-						if (ch != null) {
-							try {
-								ch.dos.writeUTF("GROUP_CREATED");
-								ch.dos.writeInt(gid);
-								ch.dos.writeUTF(finalGroupName);
-								ch.dos.flush();
-							} catch (IOException e) {
-								e.printStackTrace();
-							}
-						}
-					}
+					handleCreateGroup(client, dis);
 				} else if (type.equals("GET_GROUP_HISTORY")) {
-					int gid = dis.readInt();
-					java.util.List<String[]> rows = ConnectDatabase.getGroupHistory(gid);
-					dos.writeUTF("GROUP_HISTORY");
-					dos.writeInt(gid);
-					dos.writeInt(rows.size());
-					for (String[] r : rows) {
-						dos.writeUTF(r[0]); // senderName
-						dos.writeUTF(r[1]); // content
-						dos.writeUTF(r[2]); // ts
-					}
-					dos.flush();
-
+					handleGetGroupHistory(client, dis);
 				} else if (type.equals("GROUP_MSG")) {
-					int gid = dis.readInt();
-					String content = dis.readUTF();
-					ConnectDatabase.saveGroupMessage(gid, client.userId, content);
-
-					// phát cho các thành viên online trong nhóm (trừ người gửi)
-					String groupName = ConnectDatabase.getGroupName(gid);
-					java.util.List<Integer> memberIds = ConnectDatabase.getGroupMemberIds(gid);
-					for (int uid : memberIds) {
-						ClientHandler ch = clientsById.get(uid);
-						if (ch != null) {
-							try {
-								ch.dos.writeUTF("GROUP_MSG");
-								ch.dos.writeInt(gid);
-								ch.dos.writeUTF(groupName);
-								ch.dos.writeUTF(client.username); // senderName
-								ch.dos.writeUTF(content);
-								ch.dos.flush();
-							} catch (IOException e) {
-								e.printStackTrace();
-							}
-						}
-					}
-
+					handleGroupMsg(client, dis);
 				} 
-// nguyên thêm gọi video
-				// ==== VIDEO CALL ====
+				// ==== VIDEO & AUDIO CALL ====
 				else if (type.equals(Protocol.CMD_VIDEO_CALL_REQUEST)) {
-				    // client yêu cầu gọi video tới toUserId
-				    int toUserId = dis.readInt();
-				    client.videoTargetUserId = toUserId;
-
-				    ClientHandler receiver = clientsById.get(toUserId);
-				    if (receiver != null) {
-				        receiver.dos.writeUTF(Protocol.RESP_VIDEO_CALL_INCOMING);
-				        receiver.dos.writeInt(client.userId);      // ai gọi
-				        receiver.dos.writeUTF(client.username);    // tên ai gọi
-				        receiver.dos.flush();
-				    }
-
+					handleVideoCallRequest(client, dis);
 				} else if (type.equals(Protocol.CMD_VIDEO_CALL_ACCEPT)) {
-				    // người được gọi chấp nhận
-				    int callerId = dis.readInt();                 // id người gọi
-				    ClientHandler caller = clientsById.get(callerId);
-				    if (caller != null) {
-				        // báo cho caller biết đã được accept
-				        caller.dos.writeUTF(Protocol.RESP_VIDEO_CALL_ACCEPTED);
-				        caller.dos.writeInt(client.userId);       // calleeId
-				        caller.dos.writeUTF(client.username);     // calleeName
-				        caller.dos.flush();
-				    }
-
-				    // thiết lập quan hệ call 2 chiều
-				    client.videoTargetUserId = callerId;
-				    if (caller != null) caller.videoTargetUserId = client.userId;
-
+					handleVideoCallAccept(client, dis);
 				} else if (type.equals(Protocol.CMD_VIDEO_CALL_REJECT)) {
-				    // người được gọi từ chối
-				    int callerId = dis.readInt();
-				    ClientHandler caller = clientsById.get(callerId);
-				    if (caller != null) {
-				        caller.dos.writeUTF(Protocol.RESP_VIDEO_CALL_REJECTED);
-				        caller.dos.writeUTF(client.username + " đã từ chối cuộc gọi video.");
-				        caller.dos.flush();
-				    }
-
+					handleVideoCallReject(client, dis);
 				} else if (type.equals(Protocol.CMD_VIDEO_CALL_END)) {
-				    // một bên kết thúc
-				    int partnerId = dis.readInt();
-				    ClientHandler partner = clientsById.get(partnerId);
-				    if (partner != null) {
-				        partner.dos.writeUTF(Protocol.RESP_VIDEO_CALL_ENDED);
-				        partner.dos.flush();
-				    }
-
-				    client.videoTargetUserId = null;
-				    if (partner != null) partner.videoTargetUserId = null;
-
-				} else if (type.equals(Protocol.CMD_VIDEO_FRAME)) {
-				    // forward frame cho đối tác hiện tại
-				    int len = dis.readInt();
-				    byte[] bytes = new byte[len];
-				    dis.readFully(bytes);
-
-				    Integer toUserId = client.videoTargetUserId;
-				    if (toUserId != null) {
-				        ClientHandler receiver = clientsById.get(toUserId);
-				        if (receiver != null) {
-				            synchronized (receiver.dos) {
-				                receiver.dos.writeUTF(Protocol.CMD_VIDEO_FRAME);
-				                receiver.dos.writeInt(len);
-				                receiver.dos.write(bytes);
-				                receiver.dos.flush();
-				            }
-				        }
-				    }
+					handleVideoCallEnd(client, dis);
+				} else if (type.equals(Protocol.CMD_VIDEO_FRAME) || type.equals(Protocol.CMD_AUDIO_FRAME)) {
+					forwardMediaFrame(client, dis, type);
 				}
-// nguyen them Audio 
-				
-				else if (type.equals(Protocol.CMD_AUDIO_FRAME)) {
-				    int len = dis.readInt();
-				    byte[] bytes = new byte[len];
-				    dis.readFully(bytes);
-
-				    Integer toUserId = client.videoTargetUserId;
-				    if (toUserId != null) {
-				        ClientHandler receiver = clientsById.get(toUserId);
-				        if (receiver != null) {
-				            synchronized (receiver.dos) {
-				                receiver.dos.writeUTF(Protocol.CMD_AUDIO_FRAME);
-				                receiver.dos.writeInt(len);
-				                receiver.dos.write(bytes);
-				                receiver.dos.flush();
-				            }
-				        }
-				    }
-				}
-
-				
-				else if (type.equals("LEAVE_GROUP")) {
-				    int groupId = dis.readInt();
-
-				    boolean ok = ConnectDatabase.leaveGroup(client.userId, groupId);
-
-				    if (ok) {
-				        dos.writeUTF("LEAVE_GROUP_SUCCESS");
-				        dos.writeInt(groupId);
-				        dos.flush();
-
-				        // Thông báo cho các thành viên còn lại
-				        List<Integer> members = ConnectDatabase.getGroupMemberIds(groupId);
-				        for (int uid : members) {
-				            ClientHandler ch = clientsById.get(uid);
-				            if (ch != null) {
-				                ch.dos.writeUTF("GROUP_MEMBER_LEFT");
-				                ch.dos.writeInt(groupId);
-				                ch.dos.writeUTF(client.username);
-				                ch.dos.flush();
-				            }
-				        }
-				    } else {
-				        dos.writeUTF("LEAVE_GROUP_FAILED");
-				        dos.flush();
-				    }
-				}
-
-				
-				else {
-					if (type.equals("SEND_FILE")) {
-						int toUserId = dis.readInt();
-						receiveAndSendFileToUser(client, toUserId);
-					} else if (type.equals("SEND_GROUP_FILE")) {
-						int groupId = dis.readInt();
-						receiveAndSendFileToGroup(client, groupId);
-					} else if (type.equals("FILE")) {
-						// Giữ lại nếu vẫn muốn hỗ trợ broadcast (không cần thiết)
-						receiveAndBroadcastFile(client);
-					}
-
-					else if (type.equals("DM")) {
-						int toUserId = dis.readInt();
-						String content = dis.readUTF();
-
-						// LƯU DB trước rồi mới chuyển tiếp
-						ConnectDatabase.saveMessage(client.userId, toUserId, content);
-						sendDirectMessage(client, toUserId, content);
-
-						view.addMessage("(DM) " + client.username + " → " + toUserId + ": " + content);
-
-					} else if (type.equals("GET_HISTORY")) {
-						int otherUserId = dis.readInt();
-						// LẤY LỊCH SỬ & TRẢ VỀ
-						java.util.List<String[]> rows = ConnectDatabase.getMessagesBetween(client.userId, otherUserId);
-
-						dos.writeUTF("HISTORY");
-						dos.writeInt(otherUserId); // để client biết lịch sử này của ai
-						dos.writeInt(rows.size()); // số dòng
-						for (String[] r : rows) {
-							dos.writeUTF(r[0]); // senderName
-							dos.writeUTF(r[1]); // content
-							dos.writeUTF(r[2]); // timestamp (string)
-						}
-						dos.flush();
-
-					} else {
-						broadcastChat(client.username + ": " + type, client);
-						view.addMessage(client.username + ": " + type);
-					}
-				}
-
-			}
-
-		} catch (IOException e) {
-			e.printStackTrace();
-		}
-	}
-	
-	private void startVideoForward(ClientHandler sender, int toUserId) {
-	    new Thread(() -> {
-	        try {
-	            ClientHandler receiver = clientsById.get(toUserId);
-	            if (receiver == null) {
-	                sender.dos.writeUTF("DM");
-	                sender.dos.writeUTF("Hệ thống");
-	                sender.dos.writeUTF("Người nhận không trực tuyến.");
-	                sender.dos.flush();
-	                return;
-	            }
-
-	            // Thông báo cho người nhận mở khung video
-	            receiver.dos.writeUTF("START_VIDEO_INCOMING");
-	            receiver.dos.writeUTF(sender.username);
-	            receiver.dos.flush();
-
-	            System.out.println("📡 Chuyển tiếp video từ " + sender.username + " → " + receiver.username);
-
-	            while (true) {
-	                int len = sender.dis.readInt();
-	                byte[] bytes = new byte[len];
-	                sender.dis.readFully(bytes);
-
-	                synchronized (receiver.dos) {
-	                    receiver.dos.writeUTF("VIDEO_FRAME");
-	                    receiver.dos.writeInt(len);
-	                    receiver.dos.write(bytes);
-	                    receiver.dos.flush();
-	                }
-	            }
-	        } catch (IOException e) {
-	            System.out.println("🔴 Dừng truyền video giữa " + sender.username);
-	        }
-	    }).start();
-	}
-
-
-	// nguyen them
-
-	private void sendDirectMessage(ClientHandler sender, int toUserId, String content) {
-		ClientHandler receiver = clientsById.get(toUserId);
-		if (receiver != null) {
-			try {
-				// Gửi cho người nhận
-				receiver.dos.writeUTF("DM");
-				receiver.dos.writeUTF(sender.username); // ai gửi
-				receiver.dos.writeUTF(content); // nội dung
-				receiver.dos.flush();
-
-	            // (tuỳ chọn) Echo cho người gửi để hiển thị ngay
-	            sender.dos.writeUTF("DM");
-	            sender.dos.writeUTF("Bạn → " + receiver.username);
-	            sender.dos.writeUTF(content);
-	            sender.dos.flush();
-			} catch (IOException e) {
-				e.printStackTrace();
-			}
-		} else {
-			// (tuỳ chọn) báo lại cho sender nếu người nhận offline
-			try {
-				sender.dos.writeUTF("DM");
-				sender.dos.writeUTF("Hệ thống");
-				sender.dos.writeUTF("Người nhận hiện không trực tuyến.");
-				sender.dos.flush();
-			} catch (IOException ex) {
-				ex.printStackTrace();
-			}
-		}
-	}
-
-	// Broadcast chat
-	private void broadcastChat(String message, ClientHandler sender) {
-	    synchronized (clients) {
-	        for (ClientHandler client : clients) {
-	            try {
-	                client.dos.writeUTF("BROADCAST");
-	                client.dos.writeUTF(message);
-	                client.dos.flush();
-	            } catch (IOException e) {
-	                e.printStackTrace();
-	            }
-	        }
-	    }
-	}
-
-
-	// Gửi file đến tất cả client khác
-	private void receiveAndBroadcastFile(ClientHandler sender) {
-		try {
-			String fileName = sender.dis.readUTF();
-			long fileSize = sender.dis.readLong();
-			
-			File tempFile = new File(fileName);
-			try (FileOutputStream fos = new FileOutputStream(tempFile)) {
-				byte[] buffer = new byte[4096];
-				int bytesRead;
-				long remaining = fileSize;
-				while (remaining > 0
-						&& (bytesRead = sender.dis.read(buffer, 0, (int) Math.min(buffer.length, remaining))) != -1) {
-					fos.write(buffer, 0, bytesRead);
-					remaining -= bytesRead;
-				}
-			}
-
-			byte[] allBytes = Files.readAllBytes(tempFile.toPath());
-
-			synchronized (clients) {
-				for (ClientHandler client : clients) {
-					if (client != sender) {
-						client.dos.writeUTF("FILE");
-						client.dos.writeUTF(fileName);
-						client.dos.writeLong(allBytes.length);
-						client.dos.write(allBytes);
-						client.dos.flush();
-					}
+				// ==== FILE & TIN NHẮN ====
+				else if (type.equals("SEND_FILE")) {
+					int toUserId = dis.readInt();
+					receiveAndSendFileToUser(client, toUserId);
+				} else if (type.equals("SEND_GROUP_FILE")) {
+					int groupId = dis.readInt();
+					receiveAndSendFileToGroup(client, groupId);
+				} else if (type.equals("DM")) {
+					int toUserId = dis.readInt();
+					String content = dis.readUTF();
+					ConnectDatabase.saveMessage(client.userId, toUserId, content);
+					sendDirectMessage(client, toUserId, content);
+				} else if (type.equals("GET_HISTORY")) {
+					handleGetPrivateHistory(client, dis);
+				} else if (type.equals("LEAVE_GROUP")) {
+					handleLeaveGroup(client, dis);
+				} else {
+					broadcastChat(client.username + ": " + type, "BROADCAST");
+					view.addMessage("[CHAT ALL] " + client.username + ": " + type);
 				}
 			}
 
 		} catch (IOException e) {
-			e.printStackTrace();
+		} finally {
+			removeClient(clientUsername);
+			view.addMessage("[QUIT] " + clientUsername + " đã ngắt kết nối.");
 		}
 	}
 
-	// === Gửi file riêng cho 1 người dùng ===
-	private void receiveAndSendFileToUser(ClientHandler sender, int toUserId) {
-		try {
-			String fileName = sender.dis.readUTF();
-			long fileSize = sender.dis.readLong();
+	// --- CÁC HÀM HỖ TRỢ LOGIC ---
 
-			File tempFile = new File(fileName);
-			try (FileOutputStream fos = new FileOutputStream(tempFile)) {
-				byte[] buffer = new byte[4096];
-				int bytesRead;
-				long remaining = fileSize;
-				while (remaining > 0
-						&& (bytesRead = sender.dis.read(buffer, 0, (int) Math.min(buffer.length, remaining))) != -1) {
-					fos.write(buffer, 0, bytesRead);
-					remaining -= bytesRead;
-				}
-			}
-
-			// Gửi lại file cho người nhận
-			ClientHandler receiver = clientsById.get(toUserId);
-			if (receiver != null) {
-				byte[] allBytes = Files.readAllBytes(tempFile.toPath());
-				receiver.dos.writeUTF("FILE");
-				receiver.dos.writeUTF(fileName);
-				receiver.dos.writeLong(allBytes.length);
-				receiver.dos.write(allBytes);
-				receiver.dos.flush();
-
-				sender.dos.writeUTF("DM");
-				sender.dos.writeUTF("Đã gửi file '" + fileName + "' cho " + receiver.username);
-				sender.dos.flush();
-
-				System.out.println("Đã gửi file riêng: " + fileName + " → " + receiver.username);
-			} else {
-				sender.dos.writeUTF("DM");
-				sender.dos.writeUTF("Người nhận hiện không trực tuyến.");
-				sender.dos.flush();
-			}
-		} catch (IOException e) {
-			e.printStackTrace();
+	private void sendUserGroups(ClientHandler client) throws IOException {
+		List<String[]> groups = ConnectDatabase.getGroupsOfUser(client.userId);
+		for (String[] g : groups) {
+			client.dos.writeUTF("GROUP_CREATED");
+			client.dos.writeInt(Integer.parseInt(g[0]));
+			client.dos.writeUTF(g[1]);
+			client.dos.flush();
 		}
 	}
 
-	// === Gửi file cho tất cả thành viên trong nhóm ===
-	private void receiveAndSendFileToGroup(ClientHandler sender, int groupId) {
-		try {
-			String fileName = sender.dis.readUTF();
-			long fileSize = sender.dis.readLong();
+	private void handleCreateGroup(ClientHandler client, DataInputStream dis) throws IOException {
+		String groupName = dis.readUTF();
+		int count = dis.readInt();
+		List<Integer> members = new ArrayList<>();
+		for (int i = 0; i < count; i++) members.add(dis.readInt());
 
-			File tempFile = new File(fileName);
-			try (FileOutputStream fos = new FileOutputStream(tempFile)) {
-				byte[] buffer = new byte[4096];
-				int bytesRead;
-				long remaining = fileSize;
-				while (remaining > 0
-						&& (bytesRead = sender.dis.read(buffer, 0, (int) Math.min(buffer.length, remaining))) != -1) {
-					fos.write(buffer, 0, bytesRead);
-					remaining -= bytesRead;
-				}
+		int gid = ConnectDatabase.createGroup(groupName, client.userId, members);
+		members.add(client.userId);
+		
+		view.addMessage("[GROUP] " + client.username + " vừa tạo nhóm mới: " + groupName);
+
+		for (int uid : members) {
+			ClientHandler ch = clientsById.get(uid);
+			if (ch != null) {
+				ch.dos.writeUTF("GROUP_CREATED");
+				ch.dos.writeInt(gid);
+				ch.dos.writeUTF(groupName);
+				ch.dos.flush();
 			}
+		}
+	}
 
-			byte[] allBytes = Files.readAllBytes(tempFile.toPath());
-			java.util.List<Integer> memberIds = ConnectDatabase.getGroupMemberIds(groupId);
+	private void handleGroupMsg(ClientHandler client, DataInputStream dis) throws IOException {
+		int gid = dis.readInt();
+		String content = dis.readUTF();
+		ConnectDatabase.saveGroupMessage(gid, client.userId, content);
 
-			for (int uid : memberIds) {
+		String groupName = ConnectDatabase.getGroupName(gid);
+		
+		// LOG TIN NHẮN NHÓM
+view.addMessage("[GROUP: " + groupName + "] " + client.username + ": " + content);
+
+		List<Integer> memberIds = ConnectDatabase.getGroupMemberIds(gid);
+		for (int uid : memberIds) {
+			// ✅ SỬA: Kiểm tra uid khác với người gửi để không bị lặp tin nhắn
+			if (uid != client.userId) { 
 				ClientHandler ch = clientsById.get(uid);
-				if (ch != null && ch.userId != sender.userId) {
-					ch.dos.writeUTF("FILE");
-					ch.dos.writeUTF(fileName);
-					ch.dos.writeLong(allBytes.length);
-					ch.dos.write(allBytes);
+				if (ch != null) {
+					ch.dos.writeUTF("GROUP_MSG");
+					ch.dos.writeInt(gid);
+					ch.dos.writeUTF(groupName);
+					ch.dos.writeUTF(client.username);
+					ch.dos.writeUTF(content);
 					ch.dos.flush();
 				}
 			}
-
-			System.out.println("Đã gửi file '" + fileName + "' cho nhóm ID " + groupId);
-		} catch (IOException e) {
-			e.printStackTrace();
 		}
 	}
-	
-	// nguyên thêm gọi video 
 
-	// Gửi friend list cho 1 client
+	// --- VIDEO CALL LOGIC ---
+
+	private void handleVideoCallRequest(ClientHandler client, DataInputStream dis) throws IOException {
+		int toUserId = dis.readInt();
+		client.videoTargetUserId = toUserId;
+		ClientHandler receiver = clientsById.get(toUserId);
+		if (receiver != null) {
+			// LOG YÊU CẦU GỌI
+			view.addMessage("[VIDEO CALL] " + client.username + " đang gọi video cho " + receiver.username);
+			
+			receiver.dos.writeUTF(Protocol.RESP_VIDEO_CALL_INCOMING);
+			receiver.dos.writeInt(client.userId);
+			receiver.dos.writeUTF(client.username);
+			receiver.dos.flush();
+		}
+	}
+
+	private void handleVideoCallAccept(ClientHandler client, DataInputStream dis) throws IOException {
+		int callerId = dis.readInt();
+		ClientHandler caller = clientsById.get(callerId);
+		if (caller != null) {
+			// LOG CHẤP NHẬN
+			view.addMessage("[VIDEO CALL] " + client.username + " đã chấp nhận cuộc gọi từ " + caller.username);
+			
+			caller.dos.writeUTF(Protocol.RESP_VIDEO_CALL_ACCEPTED);
+			caller.dos.writeInt(client.userId);
+			caller.dos.writeUTF(client.username);
+			caller.dos.flush();
+			caller.videoTargetUserId = client.userId;
+		}
+		client.videoTargetUserId = callerId;
+	}
+
+	private void handleVideoCallReject(ClientHandler client, DataInputStream dis) throws IOException {
+		int callerId = dis.readInt();
+		ClientHandler caller = clientsById.get(callerId);
+		if (caller != null) {
+			// LOG TỪ CHỐI
+			view.addMessage("[VIDEO CALL] " + client.username + " đã từ chối cuộc gọi từ " + caller.username);
+			
+			caller.dos.writeUTF(Protocol.RESP_VIDEO_CALL_REJECTED);
+			caller.dos.writeUTF(client.username + " đã từ chối cuộc gọi.");
+			caller.dos.flush();
+		}
+	}
+
+	private void handleVideoCallEnd(ClientHandler client, DataInputStream dis) throws IOException {
+		int partnerId = dis.readInt();
+		ClientHandler partner = clientsById.get(partnerId);
+		if (partner != null) {
+			// LOG KẾT THÚC
+			view.addMessage("[VIDEO CALL] Cuộc gọi giữa " + client.username + " và " + partner.username + " đã kết thúc.");
+			
+			partner.dos.writeUTF(Protocol.RESP_VIDEO_CALL_ENDED);
+			partner.dos.flush();
+			partner.videoTargetUserId = null;
+		}
+		client.videoTargetUserId = null;
+	}
+
+	private void forwardMediaFrame(ClientHandler client, DataInputStream dis, String type) throws IOException {
+		int len = dis.readInt();
+		byte[] bytes = new byte[len];
+		dis.readFully(bytes);
+		Integer toUserId = client.videoTargetUserId;
+		if (toUserId != null) {
+			ClientHandler receiver = clientsById.get(toUserId);
+			if (receiver != null) {
+				synchronized (receiver.dos) {
+					receiver.dos.writeUTF(type);
+					receiver.dos.writeInt(len);
+					receiver.dos.write(bytes);
+					receiver.dos.flush();
+				}
+			}
+		}
+	}
+
+	// --- MESSAGE & FILE ---
+
+	public void broadcastChat(String message, String protocolType) {
+		synchronized (clients) {
+			for (ClientHandler client : clients) {
+				try {
+					client.dos.writeUTF(protocolType);
+					client.dos.writeUTF(message);
+					client.dos.flush();
+				} catch (IOException e) {
+					e.printStackTrace();
+				}
+			}
+		}
+	}
+
+	private void sendDirectMessage(ClientHandler sender, int toUserId, String content) throws IOException {
+		ClientHandler receiver = clientsById.get(toUserId);
+		if (receiver != null) {
+			// LOG TIN NHẮN RIÊNG
+			view.addMessage("[DM] " + sender.username + " -> " + receiver.username + ": " + content);
+			
+			receiver.dos.writeUTF("DM");
+			receiver.dos.writeUTF(sender.username);
+			receiver.dos.writeUTF(content);
+			receiver.dos.flush();
+		}
+	}
+
+	private void handleGetPrivateHistory(ClientHandler client, DataInputStream dis) throws IOException {
+		int otherUserId = dis.readInt();
+		List<String[]> rows = ConnectDatabase.getMessagesBetween(client.userId, otherUserId);
+		client.dos.writeUTF("HISTORY");
+		client.dos.writeInt(otherUserId);
+		client.dos.writeInt(rows.size());
+		for (String[] r : rows) {
+			client.dos.writeUTF(r[0]); 
+			client.dos.writeUTF(r[1]); 
+			client.dos.writeUTF(r[2]); 
+		}
+		client.dos.flush();
+	}
+
+	private void handleGetGroupHistory(ClientHandler client, DataInputStream dis) throws IOException {
+		int gid = dis.readInt();
+		List<String[]> rows = ConnectDatabase.getGroupHistory(gid);
+		client.dos.writeUTF("GROUP_HISTORY");
+		client.dos.writeInt(gid);
+		client.dos.writeInt(rows.size());
+		for (String[] r : rows) {
+			client.dos.writeUTF(r[0]);
+			client.dos.writeUTF(r[1]);
+			client.dos.writeUTF(r[2]);
+		}
+		client.dos.flush();
+	}
+
+	private void handleLeaveGroup(ClientHandler client, DataInputStream dis) throws IOException {
+		int groupId = dis.readInt();
+		boolean ok = ConnectDatabase.leaveGroup(client.userId, groupId);
+		if (ok) {
+			view.addMessage("[GROUP] " + client.username + " đã rời khỏi nhóm ID: " + groupId);
+			
+			client.dos.writeUTF("LEAVE_GROUP_SUCCESS");
+			client.dos.writeInt(groupId);
+			client.dos.flush();
+
+			List<Integer> members = ConnectDatabase.getGroupMemberIds(groupId);
+			for (int uid : members) {
+				ClientHandler ch = clientsById.get(uid);
+				if (ch != null) {
+					ch.dos.writeUTF("GROUP_MEMBER_LEFT");
+					ch.dos.writeInt(groupId);
+					ch.dos.writeUTF(client.username);
+					ch.dos.flush();
+				}
+			}
+		}
+	}
+
+	private void receiveAndSendFileToUser(ClientHandler sender, int toUserId) throws IOException {
+		String fileName = sender.dis.readUTF();
+		long fileSize = sender.dis.readLong();
+byte[] fileData = new byte[(int) fileSize];
+		sender.dis.readFully(fileData);
+
+		ClientHandler receiver = clientsById.get(toUserId);
+		if (receiver != null) {
+			// LOG GỬI FILE
+			view.addMessage("[FILE] " + sender.username + " gửi file '" + fileName + "' cho " + receiver.username);
+			
+			receiver.dos.writeUTF("FILE");
+			receiver.dos.writeUTF(fileName);
+			receiver.dos.writeLong(fileSize);
+			receiver.dos.write(fileData);
+			receiver.dos.flush();
+		}
+	}
+
+	private void receiveAndSendFileToGroup(ClientHandler sender, int groupId) throws IOException {
+		String fileName = sender.dis.readUTF();
+		long fileSize = sender.dis.readLong();
+		byte[] fileData = new byte[(int) fileSize];
+		sender.dis.readFully(fileData);
+
+		// LOG GỬI FILE NHÓM
+		view.addMessage("[GROUP FILE] " + sender.username + " gửi file '" + fileName + "' vào nhóm ID: " + groupId);
+
+		List<Integer> memberIds = ConnectDatabase.getGroupMemberIds(groupId);
+		for (int uid : memberIds) {
+			// ✅ KHẮC PHỤC: Đã thêm dòng lấy ClientHandler ch từ clientsById
+			ClientHandler ch = clientsById.get(uid); 
+			if (ch != null && ch.userId != sender.userId) {
+				ch.dos.writeUTF("FILE");
+				ch.dos.writeUTF(fileName);
+				ch.dos.writeLong(fileSize);
+				ch.dos.write(fileData);
+				ch.dos.flush();
+			}
+		}
+	}
+
 	private void sendFriendList(ClientHandler client) throws IOException {
 		Map<Integer, String> allUsers = ConnectDatabase.getAllUsers();
 		client.dos.writeInt(allUsers.size() - 1);
-
 		for (Map.Entry<Integer, String> entry : allUsers.entrySet()) {
 			if (entry.getKey() != client.userId) {
 				client.dos.writeInt(entry.getKey());
@@ -577,71 +414,45 @@ public class Server implements Runnable {
 		client.dos.flush();
 	}
 
-	// Xóa người tham gia khỏi cuộc trò chuyện trong giao diện và server
-	public void removeParticipant(JPanel participantPanel, String username) {
-		// Gọi phương thức server để xóa client
-		removeClient(username);
-
-		// Loại bỏ panel khỏi giao diện người tham gia
-		participantPanel.removeAll();
-		participantPanel.revalidate();
-		participantPanel.repaint();
-	}
-
-	// Xóa client khỏi danh sách khi họ rời cuộc trò chuyện
 	public void removeClient(String username) {
 		synchronized (clients) {
-			Iterator<ClientHandler> iterator = clients.iterator();
-			while (iterator.hasNext()) {
-				ClientHandler client = iterator.next();
-				if (client.username.equals(username)) {
+			Iterator<ClientHandler> it = clients.iterator();
+			while (it.hasNext()) {
+				ClientHandler ch = it.next();
+				if (ch.username.equals(username)) {
 					try {
-						// Gửi thông báo cho client bị xóa
-						client.dos.writeUTF("You have been removed from the chat");
-						client.dos.flush();
-
-						// Đóng kết nối socket
-						client.socket.close();
-					} catch (IOException e) {
-						e.printStackTrace();
-					}
-
-					// Xóa client khỏi danh sách clients
-					iterator.remove();
-					clientsById.remove(client.userId);
+						ch.socket.close();
+					} catch (IOException e) {}
+					clientsById.remove(ch.userId);
+					it.remove();
+					view.removeParticipant(username); 
 					break;
 				}
 			}
 		}
 	}
 
-	// Class quản lý client
 	static class ClientHandler {
-	    int userId;
-	    String username;
-	    Socket socket;
-	    DataInputStream dis;
-	    DataOutputStream dos;
+		int userId;
+		String username;
+		Socket socket;
+		DataInputStream dis;
+		DataOutputStream dos;
+		Integer videoTargetUserId = null;
 
-	    // 👇 thêm
-	    Integer videoTargetUserId = null;
-
-	    public ClientHandler(int userId, String username, Socket socket,
-	                         DataInputStream dis, DataOutputStream dos) {
-	        this.userId = userId;
-	        this.username = username;
-	        this.socket = socket;
-	        this.dis = dis;
-	        this.dos = dos;
-	    }
+		public ClientHandler(int userId, String username, Socket socket, DataInputStream dis, DataOutputStream dos) {
+			this.userId = userId;
+			this.username = username;
+			this.socket = socket;
+			this.dis = dis;
+			this.dos = dos;
+		}
 	}
-
 
 	public static void main(String[] args) {
 		javax.swing.SwingUtilities.invokeLater(() -> {
 			ServerView view = new ServerView();
 			view.setVisible(true);
-
 			Server server = new Server(view);
 			view.setServer(server);
 			new Thread(server).start();
